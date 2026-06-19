@@ -1,0 +1,424 @@
+"""
+Incidents API routes.
+
+Implements the Incidents endpoints from ARCHITECTURE_V2.md Section 6:
+
+    GET /api/v1/incidents               - List incidents (paginated,
+                                           filterable by host, status,
+                                           severity)
+    GET /api/v1/incidents/{incident_id} - Single incident detail
+
+This module reads directly from the `incidents` collection via
+`app.db.mongo_client.get_database()`, consistent with the precedent set
+by every prior service module (no repository layer exists yet for
+`incidents`).
+
+Severity filtering note: the existing `Incident` model
+(`app.models.incident`) has no persisted `severity` field — it is only
+ever computed transiently by
+`app.services.incident_builder.compute_incident_severity` at
+build-time, and never written to the `incidents` collection (see that
+module's docstring for why). Since this task explicitly scopes
+severity filtering as "(if available)" and lists
+`app.services.incident_builder` as an available import, this module
+honors the `severity` query parameter by computing each matching
+incident's severity on-demand (reusing the existing, unmodified
+`compute_incident_severity` function against that incident's
+constituent anomalies) and filtering in application code after the
+database query, rather than as a native MongoDB query predicate. This
+is correct but not index-backed; it will not scale to very large
+incident collections without a persisted severity field and a real
+database index, which is outside this task's allowed model
+modifications.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from bson import ObjectId
+from bson.errors import InvalidId
+from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import BaseModel, Field
+from pymongo.errors import PyMongoError
+
+from app.core.logging import get_logger
+from app.db.mongo_client import get_database
+from app.models.incident import Incident, IncidentStatus
+from app.services.incident_builder import (
+    IncidentSeverity,
+    compute_incident_severity,
+)
+from app.models.anomaly import Anomaly  # noqa: F401 - re-export for type clarity
+
+logger = get_logger(__name__)
+
+router = APIRouter(prefix="/incidents", tags=["Incidents"])
+
+_INCIDENTS_COLLECTION = "incidents"
+_ANOMALIES_COLLECTION = "anomalies"
+
+_DEFAULT_PAGE = 1
+_DEFAULT_PAGE_SIZE = 20
+_MAX_PAGE_SIZE = 100
+
+
+class IncidentResponse(BaseModel):
+    """
+    API response schema for a single incident.
+
+    Mirrors `app.models.incident.Incident` but represents `id` and
+    `event_sequence` entries as strings (rather than `PyObjectId`),
+    appropriate for a JSON API response, and adds an optional
+    `severity` field populated on-demand (see module docstring).
+    """
+
+    id: str = Field(..., description="Incident document identifier.")
+    host: str = Field(..., description="Hostname this incident pertains to.")
+    start_time: datetime = Field(
+        ..., description="UTC timestamp of the earliest event in this incident."
+    )
+    end_time: datetime = Field(
+        ..., description="UTC timestamp of the latest event in this incident."
+    )
+    event_sequence: List[str] = Field(
+        ...,
+        description="Ordered references to the incident's constituent anomalies.",
+    )
+    status: IncidentStatus = Field(..., description="Analyst review status.")
+    created_at: datetime = Field(
+        ..., description="UTC timestamp at which this incident was created."
+    )
+    severity: Optional[str] = Field(
+        default=None,
+        description=(
+            "Severity rating computed on-demand from constituent "
+            "anomalies (Low/Medium/High/Critical). Not a persisted "
+            "field; null if it could not be computed (e.g. no "
+            "resolvable constituent anomalies)."
+        ),
+    )
+
+    @classmethod
+    def from_incident(
+        cls, incident: Incident, severity: Optional[IncidentSeverity]
+    ) -> "IncidentResponse":
+        """Build an `IncidentResponse` from an `Incident` model and computed severity."""
+        return cls(
+            id=str(incident.id),
+            host=incident.host,
+            start_time=incident.start_time,
+            end_time=incident.end_time,
+            event_sequence=[str(ref) for ref in incident.event_sequence],
+            status=incident.status,
+            created_at=incident.created_at,
+            severity=severity.value if severity is not None else None,
+        )
+
+
+class PaginationMeta(BaseModel):
+    """Pagination metadata included in the list response."""
+
+    page: int = Field(..., description="Current page number (1-indexed).")
+    page_size: int = Field(..., description="Number of items per page.")
+    total_items: int = Field(..., description="Total number of matching incidents.")
+    total_pages: int = Field(..., description="Total number of pages available.")
+
+
+class IncidentListResponse(BaseModel):
+    """API response schema for a paginated incident list."""
+
+    items: List[IncidentResponse] = Field(..., description="Incidents on this page.")
+    pagination: PaginationMeta = Field(..., description="Pagination metadata.")
+
+
+def _parse_object_id(raw_id: str) -> ObjectId:
+    """
+    Parse a string into an `ObjectId`, raising an HTTP 400 if invalid.
+
+    Args:
+        raw_id: The string to parse.
+
+    Returns:
+        The parsed `ObjectId`.
+
+    Raises:
+        HTTPException: 400 if `raw_id` is not a valid ObjectId.
+    """
+    try:
+        return ObjectId(raw_id)
+    except (InvalidId, TypeError) as exc:
+        logger.warning("Rejected invalid incident_id", extra={"incident_id": raw_id})
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid incident_id: {raw_id!r}",
+        ) from exc
+
+
+async def _fetch_severity_for_incident(
+    incident: Incident,
+) -> Optional[IncidentSeverity]:
+    """
+    Compute the severity rating for a single incident, by fetching its
+    constituent anomalies and delegating to
+    `compute_incident_severity`.
+
+    Returns None if the incident has no resolvable constituent
+    anomalies, rather than raising, since severity is best-effort
+    enrichment and should not break the incidents endpoint if anomaly
+    data is unavailable or malformed.
+    """
+    if not incident.event_sequence:
+        return None
+
+    db = get_database()
+
+    try:
+        anomaly_documents = await db[_ANOMALIES_COLLECTION].find(
+            {"_id": {"$in": incident.event_sequence}}
+        ).to_list(length=None)
+    except PyMongoError:
+        logger.exception(
+            "Failed to fetch constituent anomalies for severity "
+            "computation",
+            extra={"incident_id": str(incident.id)},
+        )
+        return None
+
+    anomalies = []
+    for document in anomaly_documents:
+        try:
+            anomalies.append(Anomaly(**document))
+        except Exception:  # noqa: BLE001 - isolate one bad document
+            logger.warning(
+                "Skipping malformed anomalies document during severity "
+                "computation",
+                extra={
+                    "incident_id": str(incident.id),
+                    "anomaly_id": str(document.get("_id")),
+                },
+            )
+
+    if not anomalies:
+        return None
+
+    try:
+        return compute_incident_severity(anomalies)
+    except ValueError:
+        logger.warning(
+            "Could not compute severity for incident",
+            extra={"incident_id": str(incident.id)},
+        )
+        return None
+
+
+def _build_mongo_filter(
+    host: Optional[str], incident_status: Optional[IncidentStatus]
+) -> Dict[str, Any]:
+    """
+    Build the MongoDB filter for incidents matching `host` and/or
+    `incident_status`.
+
+    Severity is intentionally excluded here (see module docstring) —
+    it is applied in application code after the database query, not
+    as a native filter predicate.
+    """
+    mongo_filter: Dict[str, Any] = {}
+    if host is not None:
+        mongo_filter["host"] = host
+    if incident_status is not None:
+        mongo_filter["status"] = incident_status.value
+    return mongo_filter
+
+
+@router.get(
+    "",
+    response_model=IncidentListResponse,
+    summary="List incidents",
+    description=(
+        "List incidents, paginated and optionally filtered by host, "
+        "status, and severity (computed on-demand)."
+    ),
+)
+async def list_incidents(
+    page: int = Query(default=_DEFAULT_PAGE, ge=1, description="Page number (1-indexed)."),
+    page_size: int = Query(
+        default=_DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=_MAX_PAGE_SIZE,
+        description="Number of incidents per page.",
+    ),
+    host: Optional[str] = Query(default=None, description="Filter by exact hostname."),
+    incident_status: Optional[IncidentStatus] = Query(
+        default=None, alias="status", description="Filter by incident status."
+    ),
+    severity: Optional[IncidentSeverity] = Query(
+        default=None,
+        description=(
+            "Filter by computed severity. Applied in application code "
+            "after the database query (see module docstring); may be "
+            "slower on large result sets."
+        ),
+    ),
+) -> IncidentListResponse:
+    """
+    List incidents with pagination and optional host/status/severity
+    filters.
+
+    Raises:
+        HTTPException: 500 if the database query fails.
+    """
+    logger.info(
+        "Listing incidents",
+        extra={
+            "page": page,
+            "page_size": page_size,
+            "host": host,
+            "status": incident_status.value if incident_status else None,
+            "severity": severity.value if severity else None,
+        },
+    )
+
+    db = get_database()
+    mongo_filter = _build_mongo_filter(host, incident_status)
+
+    try:
+        if severity is None:
+            total_items = await db[_INCIDENTS_COLLECTION].count_documents(
+                mongo_filter
+            )
+            skip = (page - 1) * page_size
+            cursor = (
+                db[_INCIDENTS_COLLECTION]
+                .find(mongo_filter)
+                .sort("created_at", -1)
+                .skip(skip)
+                .limit(page_size)
+            )
+            raw_documents = await cursor.to_list(length=page_size)
+        else:
+            # Severity is not queryable in MongoDB; fetch all
+            # matching-on-other-filters incidents, compute severity
+            # per incident, filter, then paginate in memory. Bounded
+            # by total incident volume rather than page_size, which is
+            # the documented tradeoff of computing severity on-demand.
+            raw_documents = await db[_INCIDENTS_COLLECTION].find(
+                mongo_filter
+            ).sort("created_at", -1).to_list(length=None)
+    except PyMongoError as exc:
+        logger.exception("Failed to query incidents collection")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve incidents.",
+        ) from exc
+
+    incidents: List[Incident] = []
+    for document in raw_documents:
+        try:
+            incidents.append(Incident(**document))
+        except Exception:  # noqa: BLE001 - isolate one bad document
+            logger.warning(
+                "Skipping malformed incidents document",
+                extra={"incident_id": str(document.get("_id"))},
+            )
+
+    if severity is None:
+        response_items = [
+            IncidentResponse.from_incident(incident, None) for incident in incidents
+        ]
+        total_pages = (
+            (total_items + page_size - 1) // page_size if total_items > 0 else 0
+        )
+    else:
+        matched: List[IncidentResponse] = []
+        for incident in incidents:
+            computed_severity = await _fetch_severity_for_incident(incident)
+            if computed_severity == severity:
+                matched.append(
+                    IncidentResponse.from_incident(incident, computed_severity)
+                )
+
+        total_items = len(matched)
+        total_pages = (
+            (total_items + page_size - 1) // page_size if total_items > 0 else 0
+        )
+        start_index = (page - 1) * page_size
+        response_items = matched[start_index : start_index + page_size]
+
+    logger.info(
+        "Retrieved incidents",
+        extra={"returned_count": len(response_items), "total_items": total_items},
+    )
+
+    return IncidentListResponse(
+        items=response_items,
+        pagination=PaginationMeta(
+            page=page,
+            page_size=page_size,
+            total_items=total_items,
+            total_pages=total_pages,
+        ),
+    )
+
+
+@router.get(
+    "/{incident_id}",
+    response_model=IncidentResponse,
+    summary="Get incident detail",
+    description="Retrieve a single incident by its ID, including computed severity.",
+)
+async def get_incident(incident_id: str) -> IncidentResponse:
+    """
+    Retrieve a single incident by ID.
+
+    Raises:
+        HTTPException: 400 if `incident_id` is not a valid ObjectId,
+            404 if no matching incident exists, 500 if the database
+            query fails.
+    """
+    object_id = _parse_object_id(incident_id)
+
+    logger.info("Fetching incident detail", extra={"incident_id": incident_id})
+
+    db = get_database()
+
+    try:
+        document = await db[_INCIDENTS_COLLECTION].find_one({"_id": object_id})
+    except PyMongoError as exc:
+        logger.exception(
+            "Failed to query incidents collection for incident detail",
+            extra={"incident_id": incident_id},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve incident.",
+        ) from exc
+
+    if document is None:
+        logger.info("Incident not found", extra={"incident_id": incident_id})
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident not found: {incident_id}",
+        )
+
+    try:
+        incident = Incident(**document)
+    except Exception as exc:  # noqa: BLE001 - malformed stored document
+        logger.exception(
+            "Failed to parse incident document",
+            extra={"incident_id": incident_id},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Stored incident document is malformed.",
+        ) from exc
+
+    severity = await _fetch_severity_for_incident(incident)
+
+    logger.info(
+        "Retrieved incident detail",
+        extra={"incident_id": incident_id, "severity": severity.value if severity else None},
+    )
+
+    return IncidentResponse.from_incident(incident, severity)
