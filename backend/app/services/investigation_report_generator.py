@@ -55,6 +55,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
+from bson.errors import InvalidId
+
 from pymongo.errors import PyMongoError
 
 from app.core.logging import get_logger
@@ -436,6 +439,28 @@ async def _fetch_unreported_incidents() -> List[Incident]:
     )
     return incidents
 
+async def _incident_already_has_report(
+    incident_id: ObjectId,
+) -> bool:
+    """
+    Check whether an incident already has an investigation report.
+    """
+    db = get_database()
+
+    try:
+        existing = await db[_INVESTIGATIONS_COLLECTION].find_one(
+            {"incident_ref": incident_id}
+        )
+    except PyMongoError as exc:
+        logger.exception(
+            "Failed to check for existing investigation",
+            extra={"incident_id": str(incident_id)},
+        )
+        raise InvestigationReportError(
+            f"Failed to query investigation report: {exc}"
+        ) from exc
+
+    return existing is not None
 
 async def _build_investigation(incident: Incident) -> Investigation:
     """
@@ -489,6 +514,56 @@ async def _build_investigation(incident: Incident) -> Investigation:
         generated_at=datetime.now(timezone.utc),
     )
 
+async def generate_investigation_for_incident(
+    incident_id: str,
+) -> Optional[Investigation]:
+    """
+    Generate and persist an investigation report
+    for a single incident.
+    """
+    try:
+        object_id = ObjectId(incident_id)
+    except (InvalidId, TypeError) as exc:
+        raise InvestigationReportError(
+            f"Invalid incident_id: {incident_id}"
+        ) from exc
+
+    db = get_database()
+
+    try:
+        document = await db[_INCIDENTS_COLLECTION].find_one(
+            {"_id": object_id}
+        )
+    except PyMongoError as exc:
+        raise InvestigationReportError(
+            f"Failed to fetch incident: {exc}"
+        ) from exc
+
+    if document is None:
+        return None
+
+    incident = Incident(**document)
+
+    if await _incident_already_has_report(incident.id):
+        existing = await db[_INVESTIGATIONS_COLLECTION].find_one(
+            {"incident_ref": incident.id}
+        )
+
+        return (
+            Investigation(**existing)
+            if existing
+            else None
+        )
+
+    investigation = await _build_investigation(
+        incident
+    )
+
+    await _insert_investigations(
+        [investigation]
+    )
+
+    return investigation
 
 async def _insert_investigations(
     investigations: List[Investigation],
