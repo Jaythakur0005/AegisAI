@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     port: int = Field(default=8000)
 
     # ---------------- CORS ----------------
-    cors_origins: str = Field(default="http://localhost:3000")
+    cors_origins: str = Field(default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173")
 
     # ---------------- MongoDB ----------------
     mongo_uri: str = Field(default="mongodb://localhost:27017")
