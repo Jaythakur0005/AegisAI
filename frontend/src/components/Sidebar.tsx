@@ -7,6 +7,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { label: "Dashboard", icon: "⬛", key: "dashboard" },
   { label: "Incidents", icon: "🛡", key: "incidents" },
+  { label: "Pipeline", icon: "⚙", key: "pipeline" },
 ];
 
 interface SidebarProps {

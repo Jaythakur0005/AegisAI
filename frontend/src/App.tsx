@@ -8,6 +8,7 @@ import {
 import Layout from "./components/Layout";
 import DashboardPage from "./pages/DashboardPage";
 import IncidentDetailPage from "./pages/IncidentDetailPage";
+import PipelinePage from "./pages/PipelinePage";
 import "./App.css";
 
 function AppShell() {
@@ -15,14 +16,25 @@ function AppShell() {
   const location = useLocation();
 
   const isIncidentDetail = location.pathname.startsWith("/incidents/");
+  const isPipeline = location.pathname === "/pipeline";
 
-  const activePage = isIncidentDetail ? "incidents" : "dashboard";
+  const activePage = isPipeline
+    ? "pipeline"
+    : isIncidentDetail
+      ? "incidents"
+      : "dashboard";
 
-  const pageTitle = isIncidentDetail ? "Incident Detail" : "Dashboard";
+  const pageTitle = isPipeline
+    ? "Pipeline"
+    : isIncidentDetail
+      ? "Incident Detail"
+      : "Dashboard";
 
-  const pageSubtitle = isIncidentDetail
-    ? "Threat investigation and risk analysis"
-    : "Incident overview";
+  const pageSubtitle = isPipeline
+    ? "Execute the seven-stage detection workflow"
+    : isIncidentDetail
+      ? "Threat investigation and risk analysis"
+      : "Incident overview";
 
   function handleNavigate(key: string): void {
     if (key === "dashboard") {
@@ -32,6 +44,11 @@ function AppShell() {
 
     if (key === "incidents") {
       navigate("/");
+      return;
+    }
+
+    if (key === "pipeline") {
+      navigate("/pipeline");
     }
   }
 
@@ -48,6 +65,7 @@ function AppShell() {
           path="/incidents/:incidentId"
           element={<IncidentDetailPage />}
         />
+        <Route path="/pipeline" element={<PipelinePage />} />
       </Routes>
     </Layout>
   );

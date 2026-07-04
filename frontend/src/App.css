@@ -559,3 +559,127 @@
   color: var(--text-muted);
   font-style: italic;
 }
+/* ─────────────────────────────────────────────────────────────────
+   PART 4 — Pipeline
+───────────────────────────────────────────────────────────────── */
+
+.pipeline-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.pipeline-panel {
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+}
+
+.pipeline-header h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 20px;
+}
+
+.pipeline-header p {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+}
+
+.pipeline-upload {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 24px;
+  flex-wrap: wrap;
+}
+
+.pipeline-file-label {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pipeline-file-input {
+  color: var(--text-secondary);
+}
+
+.pipeline-file-name {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.pipeline-status {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 20px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+
+.pipeline-status-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pipeline-status-success {
+  border-color: var(--severity-low);
+}
+
+.pipeline-status-error {
+  border-color: var(--severity-critical);
+}
+
+.pipeline-status-running {
+  border-color: var(--accent);
+}
+
+.pipeline-run-btn {
+  margin-top: 20px;
+  padding: 10px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #08111f;
+  font-weight: 700;
+}
+
+.pipeline-run-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.pipeline-run-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.pipeline-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.pipeline-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 84px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+}
+
+.pipeline-metric-value {
+  color: var(--text-primary);
+  font-size: 24px;
+  font-weight: 700;
+}
