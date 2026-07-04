@@ -1,37 +1,37 @@
-import { useState } from "react";
+import {
+  BrowserRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from "react-router-dom";
 import Layout from "./components/Layout";
 import DashboardPage from "./pages/DashboardPage";
+import IncidentDetailPage from "./pages/IncidentDetailPage";
 import "./App.css";
 
-type Page = "dashboard" | "incidents";
+function AppShell() {
+  const navigate = useNavigate();
+  const location = useLocation();
 
-const PAGE_META: Record<Page, { title: string; subtitle: string }> = {
-  dashboard: {
-    title: "Dashboard",
-    subtitle: "Incident overview",
-  },
-  incidents: {
-    title: "Incidents",
-    subtitle: "All detected incidents",
-  },
-};
+  const isIncidentDetail = location.pathname.startsWith("/incidents/");
 
-export default function App() {
-  const [activePage, setActivePage] = useState<Page>("dashboard");
+  const activePage = isIncidentDetail ? "incidents" : "dashboard";
 
-  function handleNavigate(key: string) {
-    if (key === "dashboard" || key === "incidents") {
-      setActivePage(key);
+  const pageTitle = isIncidentDetail ? "Incident Detail" : "Dashboard";
+
+  const pageSubtitle = isIncidentDetail
+    ? "Threat investigation and risk analysis"
+    : "Incident overview";
+
+  function handleNavigate(key: string): void {
+    if (key === "dashboard") {
+      navigate("/");
+      return;
     }
-  }
 
-  const meta = PAGE_META[activePage];
-
-  function renderPage() {
-    switch (activePage) {
-      case "dashboard":
-      case "incidents":
-        return <DashboardPage />;
+    if (key === "incidents") {
+      navigate("/");
     }
   }
 
@@ -39,10 +39,26 @@ export default function App() {
     <Layout
       activePage={activePage}
       onNavigate={handleNavigate}
-      pageTitle={meta.title}
-      pageSubtitle={meta.subtitle}
+      pageTitle={pageTitle}
+      pageSubtitle={pageSubtitle}
     >
-      {renderPage()}
+      <Routes>
+        <Route path="/" element={<DashboardPage />} />
+        <Route
+          path="/incidents/:incidentId"
+          element={<IncidentDetailPage />}
+        />
+      </Routes>
     </Layout>
   );
 }
+
+function App() {
+  return (
+    <BrowserRouter>
+      <AppShell />
+    </BrowserRouter>
+  );
+}
+
+export default App;

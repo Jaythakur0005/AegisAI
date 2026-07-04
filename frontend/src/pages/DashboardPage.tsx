@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { getIncidents } from "../lib/api";
 import type { IncidentResponse, IncidentListResponse } from "../types/api";
 import { ApiError } from "../lib/api";
@@ -22,6 +23,8 @@ function formatDateTime(iso: string): string {
 }
 
 export default function DashboardPage() {
+  const navigate = useNavigate();
+
   const [data, setData]       = useState<IncidentListResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState<string | null>(null);
@@ -123,7 +126,19 @@ export default function DashboardPage() {
           </thead>
           <tbody>
             {incidents.map((incident) => (
-              <tr key={incident.id}>
+              <tr
+                key={incident.id}
+                className="incident-row"
+                role="button"
+                tabIndex={0}
+                onClick={() => navigate(`/incidents/${incident.id}`)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    navigate(`/incidents/${incident.id}`);
+                  }
+                }}
+              >
                 <td className="host-cell">{incident.host}</td>
                 <td>
                   <SeverityBadge severity={incident.severity} />
