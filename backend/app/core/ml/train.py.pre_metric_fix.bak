@@ -1,0 +1,288 @@
+"""
+AegisAI autoencoder training pipeline.
+
+Trains the Stage 3 behavioural anomaly-detection autoencoder from
+ProcessedEvent feature vectors stored in MongoDB.
+
+The trained StandardScaler and Keras autoencoder are persisted to the
+configured model artifact paths. A stable reconstruction-error
+threshold and training metrics are recorded in model_metadata.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import pickle
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+from app.core.config import get_settings
+from app.db.mongo_client import (
+    close_mongo_connection,
+    connect_to_mongo,
+    get_database,
+)
+from app.models.model_metadata import ModelMetadata, TrainingMetrics
+from app.services.feature_engineering import FEATURE_NAMES
+
+
+_PROCESSED_EVENTS_COLLECTION = "processed_events"
+_MODEL_METADATA_COLLECTION = "model_metadata"
+
+_RANDOM_STATE = 42
+_VALIDATION_SIZE = 0.20
+_EPOCHS = 100
+_BATCH_SIZE = 8
+
+
+async def _load_training_matrix() -> np.ndarray:
+    db = get_database()
+
+    rows: list[list[float]] = []
+
+    cursor = db[_PROCESSED_EVENTS_COLLECTION].find({})
+
+    async for document in cursor:
+        feature_names = document.get("feature_names")
+        feature_vector = document.get("feature_vector")
+
+        if feature_names != list(FEATURE_NAMES):
+            continue
+
+        if not isinstance(feature_vector, list):
+            continue
+
+        if len(feature_vector) != len(FEATURE_NAMES):
+            continue
+
+        try:
+            row = [float(value) for value in feature_vector]
+        except (TypeError, ValueError):
+            continue
+
+        if not np.all(np.isfinite(row)):
+            continue
+
+        rows.append(row)
+
+    if len(rows) < 10:
+        raise RuntimeError(
+            "Not enough valid processed_events for training. "
+            f"Found {len(rows)} valid vectors."
+        )
+
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _build_autoencoder(input_dim: int):
+    import tensorflow as tf
+
+    inputs = tf.keras.Input(shape=(input_dim,), name="feature_input")
+
+    x = tf.keras.layers.Dense(
+        12,
+        activation="relu",
+        name="encoder_dense_12",
+    )(inputs)
+
+    x = tf.keras.layers.Dense(
+        8,
+        activation="relu",
+        name="encoder_dense_8",
+    )(x)
+
+    latent = tf.keras.layers.Dense(
+        4,
+        activation="relu",
+        name="latent_space",
+    )(x)
+
+    x = tf.keras.layers.Dense(
+        8,
+        activation="relu",
+        name="decoder_dense_8",
+    )(latent)
+
+    x = tf.keras.layers.Dense(
+        12,
+        activation="relu",
+        name="decoder_dense_12",
+    )(x)
+
+    outputs = tf.keras.layers.Dense(
+        input_dim,
+        activation="linear",
+        name="reconstruction",
+    )(x)
+
+    model = tf.keras.Model(
+        inputs=inputs,
+        outputs=outputs,
+        name="aegisai_autoencoder",
+    )
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss="mse",
+    )
+
+    return model
+
+
+async def train_autoencoder() -> None:
+    settings = get_settings()
+    db = get_database()
+
+    np.random.seed(_RANDOM_STATE)
+
+    import tensorflow as tf
+
+    tf.random.set_seed(_RANDOM_STATE)
+
+    print("=== AEGISAI STAGE 3 AUTOENCODER TRAINING ===")
+
+    feature_matrix = await _load_training_matrix()
+
+    print("VALID TRAINING WINDOWS:", feature_matrix.shape[0])
+    print("FEATURE DIMENSIONS:", feature_matrix.shape[1])
+
+    train_matrix, validation_matrix = train_test_split(
+        feature_matrix,
+        test_size=_VALIDATION_SIZE,
+        random_state=_RANDOM_STATE,
+        shuffle=True,
+    )
+
+    print("TRAIN WINDOWS:", train_matrix.shape[0])
+    print("VALIDATION WINDOWS:", validation_matrix.shape[0])
+
+    scaler = StandardScaler()
+
+    scaled_train = scaler.fit_transform(train_matrix)
+    scaled_validation = scaler.transform(validation_matrix)
+
+    model = _build_autoencoder(feature_matrix.shape[1])
+
+    print("")
+    print("=== MODEL SUMMARY ===")
+    model.summary()
+
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=12,
+        restore_best_weights=True,
+    )
+
+    history = model.fit(
+        scaled_train,
+        scaled_train,
+        validation_data=(
+            scaled_validation,
+            scaled_validation,
+        ),
+        epochs=_EPOCHS,
+        batch_size=_BATCH_SIZE,
+        shuffle=True,
+        verbose=1,
+        callbacks=[early_stopping],
+    )
+
+    train_reconstruction = model.predict(
+        scaled_train,
+        verbose=0,
+    )
+
+    train_errors = np.mean(
+        np.square(scaled_train - train_reconstruction),
+        axis=1,
+    )
+
+    threshold = float(
+        np.percentile(
+            train_errors,
+            settings.anomaly_threshold_percentile,
+        )
+    )
+
+    model_path = Path(settings.autoencoder_model_path)
+    scaler_path = Path(settings.feature_scaler_path)
+
+    model_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    scaler_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    model.save(model_path)
+
+    with scaler_path.open("wb") as handle:
+        pickle.dump(scaler, handle)
+
+    final_loss = float(history.history["loss"][-1])
+    final_val_loss = float(history.history["val_loss"][-1])
+
+    metadata = ModelMetadata(
+        model_version=settings.model_version,
+        training_date=datetime.now(timezone.utc),
+        training_data_summary=(
+            "AegisAI Stage 3 prototype autoencoder trained on "
+            f"{feature_matrix.shape[0]} selected OTRF Windows Sysmon "
+            "behavioural windows using the 16-feature Stage 2 V2 contract."
+        ),
+        threshold_value=threshold,
+        metrics=TrainingMetrics(
+            loss=final_loss,
+            val_loss=final_val_loss,
+        ),
+    )
+
+    await db[_MODEL_METADATA_COLLECTION].delete_many(
+        {"model_version": settings.model_version}
+    )
+
+    await db[_MODEL_METADATA_COLLECTION].insert_one(
+        metadata.model_dump(
+            by_alias=True,
+            exclude={"id"},
+        )
+    )
+
+    print("")
+    print("========================================")
+    print("=== TRAINING RESULT ===")
+    print("========================================")
+
+    print("MODEL VERSION:", settings.model_version)
+    print("TRAINING WINDOWS:", feature_matrix.shape[0])
+    print("FEATURE COUNT:", feature_matrix.shape[1])
+    print("EPOCHS COMPLETED:", len(history.history["loss"]))
+    print("FINAL LOSS:", final_loss)
+    print("FINAL VAL LOSS:", final_val_loss)
+    print(
+        "THRESHOLD PERCENTILE:",
+        settings.anomaly_threshold_percentile,
+    )
+    print("THRESHOLD VALUE:", threshold)
+    print("MODEL PATH:", model_path)
+    print("SCALER PATH:", scaler_path)
+
+
+async def main() -> None:
+    await connect_to_mongo()
+
+    try:
+        await train_autoencoder()
+    finally:
+        await close_mongo_connection()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

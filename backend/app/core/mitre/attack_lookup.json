@@ -1,0 +1,65 @@
+[
+  {
+    "tactic_id": "TA0002",
+    "technique_id": "T1059.001",
+    "technique_name": "PowerShell",
+    "severity_level": "High",
+    "signals": [
+      "powershell_encoded_command"
+    ]
+  },
+  {
+    "tactic_id": "TA0002",
+    "technique_id": "T1218",
+    "technique_name": "System Binary Proxy Execution",
+    "severity_level": "High",
+    "signals": [
+      "script_lolbin_execution"
+    ]
+  },
+  {
+    "tactic_id": "TA0011",
+    "technique_id": "T1071",
+    "technique_name": "Application Layer Protocol",
+    "severity_level": "Medium",
+    "signals": [
+      "external_network_connection"
+    ]
+  },
+  {
+    "tactic_id": "TA0006",
+    "technique_id": "T1003.001",
+    "technique_name": "LSASS Memory",
+    "severity_level": "Critical",
+    "signals": [
+      "lsass_access"
+    ]
+  },
+  {
+    "tactic_id": "TA0003",
+    "technique_id": "T1060",
+    "technique_name": "Registry Run Keys / Startup Folder",
+    "severity_level": "High",
+    "signals": [
+      "registry_run_key_persistence"
+    ]
+  },
+  {
+    "tactic_id": "TA0011",
+    "technique_id": "T1105",
+    "technique_name": "Ingress Tool Transfer",
+    "severity_level": "Medium",
+    "signals": [
+      "suspicious_file_drop"
+    ]
+  },
+  {
+    "tactic_id": "TA0005",
+    "technique_id": "T1055",
+    "technique_name": "Process Injection",
+    "severity_level": "Critical",
+    "signals": [
+      "process_injection_access"
+    ]
+  }
+]

@@ -45,10 +45,8 @@ from pymongo.errors import PyMongoError
 
 from app.core.logging import get_logger
 from app.db.mongo_client import get_database
-from app.models.attack_mapping import AttackMapping
 from app.models.incident import Incident, IncidentStatus
-from app.models.investigation import Investigation
-from app.models.risk_score import RiskLabel, RiskScore
+from app.models.risk_score import RiskLabel
 
 logger = get_logger(__name__)
 
@@ -56,8 +54,6 @@ router = APIRouter(prefix="/incidents", tags=["Incidents"])
 
 _INCIDENTS_COLLECTION = "incidents"
 _RISK_SCORES_COLLECTION = "risk_scores"
-_ATTACK_MAPPINGS_COLLECTION = "attack_mappings"
-_INVESTIGATIONS_COLLECTION = "investigations"
 
 _DEFAULT_PAGE = 1
 _DEFAULT_PAGE_SIZE = 20
@@ -353,78 +349,29 @@ async def list_incidents(
     )
 
 
-class RiskScoreDetailResponse(BaseModel):
-    """Persisted Stage 6 risk score detail."""
-
-    anomaly_component: float
-    technique_severity_component: float
-    asset_criticality_component: float
-    final_score: float
-    risk_label: RiskLabel
-
-
-class AttackMappingDetailResponse(BaseModel):
-    """Persisted Stage 5 MITRE ATT&CK mapping detail."""
-
-    tactic_id: str
-    technique_id: str
-    technique_name: str
-    confidence: float
-    severity_level: str
-    justification_text: str
-
-
-class InvestigationDetailResponse(BaseModel):
-    """Persisted Stage 7 investigation detail."""
-
-    narrative_text: str
-    llm_model_used: str
-    prompt_version: str
-    confidence_score: float
-    generated_at: datetime
-
-
-class IncidentDetailResponse(IncidentResponse):
-    """Incident enriched with Stage 5 and Stage 6 results."""
-
-    risk: Optional[RiskScoreDetailResponse]
-    mitre_mappings: List[AttackMappingDetailResponse]
-    investigation: Optional[InvestigationDetailResponse]
-
-
 @router.get(
     "/{incident_id}",
-    response_model=IncidentDetailResponse,
+    response_model=IncidentResponse,
     summary="Get incident detail",
-    description=(
-        "Retrieve a single incident by ID with persisted risk scoring "
-        "and MITRE ATT&CK mappings."
-    ),
+    description="Retrieve a single incident by its ID, including computed severity.",
 )
-async def get_incident(
-    incident_id: str,
-) -> IncidentDetailResponse:
+async def get_incident(incident_id: str) -> IncidentResponse:
     """
-    Retrieve a single incident with Stage 5 and Stage 6 enrichment.
+    Retrieve a single incident by ID.
 
     Raises:
-        HTTPException: 400 if `incident_id` is invalid, 404 if the
-            incident does not exist, or 500 if stored data cannot be
-            queried or validated.
+        HTTPException: 400 if `incident_id` is not a valid ObjectId,
+            404 if no matching incident exists, 500 if the database
+            query fails.
     """
     object_id = _parse_object_id(incident_id)
 
-    logger.info(
-        "Fetching incident detail",
-        extra={"incident_id": incident_id},
-    )
+    logger.info("Fetching incident detail", extra={"incident_id": incident_id})
 
     db = get_database()
 
     try:
-        document = await db[_INCIDENTS_COLLECTION].find_one(
-            {"_id": object_id}
-        )
+        document = await db[_INCIDENTS_COLLECTION].find_one({"_id": object_id})
     except PyMongoError as exc:
         logger.exception(
             "Failed to query incidents collection for incident detail",
@@ -436,10 +383,7 @@ async def get_incident(
         ) from exc
 
     if document is None:
-        logger.info(
-            "Incident not found",
-            extra={"incident_id": incident_id},
-        )
+        logger.info("Incident not found", extra={"incident_id": incident_id})
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident not found: {incident_id}",
@@ -447,7 +391,7 @@ async def get_incident(
 
     try:
         incident = Incident(**document)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - malformed stored document
         logger.exception(
             "Failed to parse incident document",
             extra={"incident_id": incident_id},
@@ -457,160 +401,11 @@ async def get_incident(
             detail="Stored incident document is malformed.",
         ) from exc
 
-    try:
-        risk_document = await db[
-            _RISK_SCORES_COLLECTION
-        ].find_one(
-            {"incident_ref": incident.id}
-        )
-
-        mapping_documents = await db[
-            _ATTACK_MAPPINGS_COLLECTION
-        ].find(
-            {"incident_ref": incident.id}
-        ).sort(
-            "technique_id",
-            1,
-        ).to_list(length=None)
-
-        investigation_document = await db[
-            _INVESTIGATIONS_COLLECTION
-        ].find_one(
-            {"incident_ref": incident.id}
-        )
-    except PyMongoError as exc:
-        logger.exception(
-            "Failed to fetch structured incident enrichment",
-            extra={"incident_id": incident_id},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve incident enrichment.",
-        ) from exc
-
-    risk_detail: Optional[RiskScoreDetailResponse] = None
-    severity: Optional[RiskLabel] = None
-
-    if risk_document is not None:
-        try:
-            risk_score = RiskScore(**risk_document)
-
-            severity = risk_score.risk_label
-
-            risk_detail = RiskScoreDetailResponse(
-                anomaly_component=risk_score.anomaly_component,
-                technique_severity_component=(
-                    risk_score.technique_severity_component
-                ),
-                asset_criticality_component=(
-                    risk_score.asset_criticality_component
-                ),
-                final_score=risk_score.final_score,
-                risk_label=risk_score.risk_label,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "Failed to parse persisted risk score",
-                extra={"incident_id": incident_id},
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Stored risk score document is malformed.",
-            ) from exc
-
-    mapping_details: List[
-        AttackMappingDetailResponse
-    ] = []
-
-    for mapping_document in mapping_documents:
-        try:
-            mapping = AttackMapping(**mapping_document)
-
-            mapping_details.append(
-                AttackMappingDetailResponse(
-                    tactic_id=mapping.tactic_id,
-                    technique_id=mapping.technique_id,
-                    technique_name=mapping.technique_name,
-                    confidence=mapping.confidence,
-                    severity_level=(
-                        mapping.severity_level.value
-                    ),
-                    justification_text=(
-                        mapping.justification_text
-                    ),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "Failed to parse persisted attack mapping",
-                extra={
-                    "incident_id": incident_id,
-                    "mapping_id": str(
-                        mapping_document.get("_id")
-                    ),
-                },
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=(
-                    "Stored attack mapping document is malformed."
-                ),
-            ) from exc
-
-    investigation_detail: Optional[
-        InvestigationDetailResponse
-    ] = None
-
-    if investigation_document is not None:
-        try:
-            investigation = Investigation(
-                **investigation_document
-            )
-
-            investigation_detail = InvestigationDetailResponse(
-                narrative_text=investigation.narrative_text,
-                llm_model_used=investigation.llm_model_used,
-                prompt_version=investigation.prompt_version,
-                confidence_score=investigation.confidence_score,
-                generated_at=investigation.generated_at,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "Failed to parse persisted investigation",
-                extra={"incident_id": incident_id},
-            )
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=(
-                    "Stored investigation document is malformed."
-                ),
-            ) from exc
-
-    incident_response = IncidentResponse.from_incident(
-        incident,
-        severity,
-    )
+    severity = await _fetch_severity_for_incident(incident)
 
     logger.info(
-        "Retrieved structured incident detail",
-        extra={
-            "incident_id": incident_id,
-            "severity": (
-                severity.value
-                if severity
-                else None
-            ),
-            "mitre_mapping_count": len(mapping_details),
-            "has_risk_score": risk_detail is not None,
-            "has_investigation": (
-                investigation_detail is not None
-            ),
-        },
+        "Retrieved incident detail",
+        extra={"incident_id": incident_id, "severity": severity.value if severity else None},
     )
 
-    return IncidentDetailResponse(
-        **incident_response.model_dump(),
-        risk=risk_detail,
-        mitre_mappings=mapping_details,
-        investigation=investigation_detail,
-    )
+    return IncidentResponse.from_incident(incident, severity)

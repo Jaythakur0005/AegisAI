@@ -5,6 +5,8 @@ Implements Stage 2 (Feature Engineering) from ARCHITECTURE_V2.md: reads
 raw Sysmon event records from the `raw_logs` collection, groups them by
 host and time window, extracts numerical feature vectors per window, and
 persists the result as `ProcessedEvent` documents into `processed_events`,
+linked back to their source `raw_logs` via `raw_log_ref`.
+
 ARCHITECTURE_V2.md Stage 2 names six feature categories without
 specifying exact formulas or window size. This module makes the
 following concrete (and documented) choices to operationalize them:
@@ -64,14 +66,8 @@ _PROCESSED_EVENTS_COLLECTION = "processed_events"
 # Sysmon Event IDs referenced by Stage 2 of ARCHITECTURE_V2.md.
 _EVENT_ID_PROCESS_CREATION = 1
 _EVENT_ID_NETWORK_CONNECTION = 3
-_EVENT_ID_IMAGE_LOAD = 7
-_EVENT_ID_PROCESS_ACCESS = 10
 _EVENT_ID_FILE_CREATE = 11
-_EVENT_ID_REGISTRY_CREATE_DELETE = 12
 _EVENT_ID_REGISTRY_SET = 13
-_EVENT_ID_NAMED_PIPE_CREATE = 17
-_EVENT_ID_NAMED_PIPE_CONNECT = 18
-_EVENT_ID_DNS_QUERY = 22
 
 # Expected/benign parent process images for the parent-child anomaly
 # heuristic. Anything else spawning a child process counts as a
@@ -101,18 +97,11 @@ _TIME_OF_DAY_BUCKETS: tuple[str, ...] = (
 # contract of every `feature_vector` this module produces, and must
 # stay in sync with `_build_feature_vector`.
 FEATURE_NAMES: tuple[str, ...] = (
-    "process_creation_count",
-    "parent_child_anomaly_count",
+    "process_creation_frequency",
+    "parent_child_process_anomalies",
     "network_connection_count",
-    "image_load_count",
-    "process_access_count",
-    "file_create_count",
-    "registry_activity_count",
-    "dns_query_count",
-    "named_pipe_activity_count",
+    "registry_file_write_count",
     "command_line_entropy_mean",
-    "unique_process_count",
-    "process_network_ratio",
     "time_of_day_night",
     "time_of_day_morning",
     "time_of_day_afternoon",
@@ -292,18 +281,11 @@ async def _fetch_raw_logs(window_minutes: int) -> List[RawLog]:
 def _group_by_host_and_window(
     raw_logs: Sequence[RawLog], window_minutes: int
 ) -> Dict[tuple[str, datetime], List[RawLog]]:
-    """
-    Group RawLog records by host and configured time window.
-    """
+    """Group RawLog records by (host, window_start) per the configured window size."""
     groups: Dict[tuple[str, datetime], List[RawLog]] = defaultdict(list)
-
     for raw_log in raw_logs:
-        window_start = _floor_to_window(
-            raw_log.timestamp,
-            window_minutes,
-        )
+        window_start = _floor_to_window(raw_log.timestamp, window_minutes)
         groups[(raw_log.host, window_start)].append(raw_log)
-
     return groups
 
 
@@ -311,128 +293,58 @@ def _build_feature_vector(
     window_raw_logs: Sequence[RawLog], window_start: datetime
 ) -> List[float]:
     """
-    Compute the Stage 2 V2 behavioural feature vector for one
-    (host, window) group.
+    Compute the ordered feature vector for one (host, window) group.
 
-    Features intentionally remain compact and explainable for the
-    college-level AegisAI anomaly-detection prototype.
+    The returned list's positions correspond exactly to `FEATURE_NAMES`.
     """
     process_creation_count = 0
     parent_child_anomaly_count = 0
     network_connection_count = 0
-    image_load_count = 0
-    process_access_count = 0
-    file_create_count = 0
-    registry_activity_count = 0
-    dns_query_count = 0
-    named_pipe_activity_count = 0
-
+    registry_file_write_count = 0
     command_line_entropies: List[float] = []
-    unique_processes: set[str] = set()
 
     for raw_log in window_raw_logs:
         raw_event = raw_log.raw_event
-        event_id = raw_log.event_id
 
-        image = _extract_event_field(
-            raw_event,
-            "Image",
-            "image",
-        ).lower()
-
-        if image:
-            unique_processes.add(image)
-
-        if event_id == _EVENT_ID_PROCESS_CREATION:
+        if raw_log.event_id == _EVENT_ID_PROCESS_CREATION:
             process_creation_count += 1
 
             command_line = _extract_event_field(
-                raw_event,
-                "CommandLine",
-                "command_line",
+                raw_event, "CommandLine", "command_line"
             )
-
-            if command_line:
-                command_line_entropies.append(
-                    _shannon_entropy(command_line)
-                )
+            command_line_entropies.append(_shannon_entropy(command_line))
 
             parent_image = _extract_event_field(
-                raw_event,
-                "ParentImage",
-                "parent_image",
+                raw_event, "ParentImage", "parent_image"
             ).lower()
-
-            parent_basename = parent_image.rsplit(
-                "\\",
-                maxsplit=1,
-            )[-1]
-
-            if (
-                parent_basename
-                and parent_basename not in _EXPECTED_PARENT_IMAGES
-            ):
+            parent_basename = parent_image.rsplit("\\", maxsplit=1)[-1]
+            if parent_basename and parent_basename not in _EXPECTED_PARENT_IMAGES:
                 parent_child_anomaly_count += 1
 
-        elif event_id == _EVENT_ID_NETWORK_CONNECTION:
+        elif raw_log.event_id == _EVENT_ID_NETWORK_CONNECTION:
             network_connection_count += 1
 
-        elif event_id == _EVENT_ID_IMAGE_LOAD:
-            image_load_count += 1
-
-        elif event_id == _EVENT_ID_PROCESS_ACCESS:
-            process_access_count += 1
-
-        elif event_id == _EVENT_ID_FILE_CREATE:
-            file_create_count += 1
-
-        elif event_id in (
-            _EVENT_ID_REGISTRY_CREATE_DELETE,
+        elif raw_log.event_id in (
+            _EVENT_ID_FILE_CREATE,
             _EVENT_ID_REGISTRY_SET,
         ):
-            registry_activity_count += 1
-
-        elif event_id == _EVENT_ID_DNS_QUERY:
-            dns_query_count += 1
-
-        elif event_id in (
-            _EVENT_ID_NAMED_PIPE_CREATE,
-            _EVENT_ID_NAMED_PIPE_CONNECT,
-        ):
-            named_pipe_activity_count += 1
+            registry_file_write_count += 1
 
     command_line_entropy_mean = (
-        sum(command_line_entropies)
-        / len(command_line_entropies)
+        sum(command_line_entropies) / len(command_line_entropies)
         if command_line_entropies
         else 0.0
     )
 
-    unique_process_count = len(unique_processes)
-
-    process_network_ratio = (
-        process_creation_count
-        / max(network_connection_count, 1)
-    )
-
     time_of_day_one_hot = [0.0] * len(_TIME_OF_DAY_BUCKETS)
-    time_of_day_one_hot[
-        _time_of_day_bucket_index(window_start)
-    ] = 1.0
+    time_of_day_one_hot[_time_of_day_bucket_index(window_start)] = 1.0
 
     return [
         float(process_creation_count),
         float(parent_child_anomaly_count),
         float(network_connection_count),
-        float(image_load_count),
-        float(process_access_count),
-        float(file_create_count),
-        float(registry_activity_count),
-        float(dns_query_count),
-        float(named_pipe_activity_count),
-        float(command_line_entropy_mean),
-        float(unique_process_count),
-        float(process_network_ratio),
+        float(registry_file_write_count),
+        command_line_entropy_mean,
         *time_of_day_one_hot,
     ]
 
@@ -508,7 +420,7 @@ async def run_feature_engineering() -> FeatureEngineeringResult:
             processed_events fails at the infrastructure level.
     """
     settings = get_settings()
-    window_minutes = settings.feature_window_minutes
+    window_minutes = settings.incident_window_minutes
 
     logger.info(
         "Starting feature engineering run",

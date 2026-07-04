@@ -54,7 +54,8 @@ class PyObjectId(ObjectId):
                 ]
             ),
             serialization=core_schema.plain_serializer_function_ser_schema(
-                str
+                str,
+                when_used="json",
             ),
         )
 

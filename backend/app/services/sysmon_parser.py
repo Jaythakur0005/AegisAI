@@ -45,8 +45,6 @@ logger = get_logger(__name__)
 # record for it to be considered parseable. `raw_event` is constructed
 # from the full payload, not required as a literal input key.
 _REQUIRED_FIELDS: tuple[str, ...] = (
-    "host",
-    "source_file",
     "event_id",
     "timestamp",
 )
@@ -137,16 +135,30 @@ def _normalize_timestamp(value: Any) -> datetime:
 
 def _validate_required_fields(event: Dict[str, Any]) -> None:
     """
-    Verify all required top-level fields are present and non-null.
+    Verify the minimum fields required to construct a RawLog.
 
-    Raises:
-        SysmonParseError: If any required field is missing or null.
+    Supports both the native AegisAI event schema and OTRF Sysmon
+    exports without mutating the original raw event payload.
     """
-    missing = [
-        field_name
-        for field_name in _REQUIRED_FIELDS
-        if field_name not in event or event[field_name] is None
-    ]
+    event_id = event.get("event_id", event.get("EventID"))
+
+    timestamp = (
+        event.get("timestamp")
+        or event.get("TimeCreated")
+        or event.get("@timestamp")
+        or event.get("TimeGenerated")
+        or event.get("UtcTime")
+        or event.get("EventTime")
+    )
+
+    missing: List[str] = []
+
+    if event_id is None:
+        missing.append("event_id/EventID")
+
+    if timestamp is None:
+        missing.append("timestamp/TimeCreated")
+
     if missing:
         raise SysmonParseError(
             f"Missing required field(s): {', '.join(missing)}",
@@ -180,24 +192,50 @@ def parse_sysmon_event(event: Dict[str, Any]) -> RawLog:
 
     _validate_required_fields(event)
 
+    timestamp_raw = (
+        event.get("timestamp")
+        or event.get("TimeCreated")
+        or event.get("@timestamp")
+        or event.get("TimeGenerated")
+        or event.get("UtcTime")
+        or event.get("EventTime")
+    )
+
+    event_id_raw = event.get(
+        "event_id",
+        event.get("EventID"),
+    )
+
     try:
-        timestamp = _normalize_timestamp(event["timestamp"])
+        timestamp = _normalize_timestamp(timestamp_raw)
     except SysmonParseError:
         raise
 
     try:
-        event_id_raw = event["event_id"]
         event_id = int(event_id_raw)
     except (TypeError, ValueError) as exc:
         raise SysmonParseError(
-            f"event_id must be an integer, got {event['event_id']!r}",
+            f"event_id/EventID must be an integer, got {event_id_raw!r}",
             event,
         ) from exc
 
     try:
+        host = str(
+            event.get("Hostname")
+            or event.get("Computer")
+            or event.get("host")
+            or "UNKNOWN-HOST"
+        )
+
+        source_file = str(
+            event.get("source_file")
+            or event.get("_source_file")
+            or "sysmon_dataset.json"
+        )
+
         raw_log = RawLog(
-            host=str(event["host"]),
-            source_file=str(event["source_file"]),
+            host=host,
+            source_file=source_file,
             event_id=event_id,
             timestamp=timestamp,
             raw_event=event,

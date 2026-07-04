@@ -300,18 +300,9 @@ def _group_by_host_and_window(
     window_minutes: int,
 ) -> Dict[tuple[str, datetime], List[Anomaly]]:
     """
-    Correlate anomalies into host-local incident sessions.
-
-    Anomalies are ordered by original processed-event time. For each
-    host, a new incident session starts only when the next anomalous
-    event begins more than `window_minutes` after the latest event end
-    already included in the current session.
-
-    This avoids arbitrary fixed-clock boundary splits such as
-    21:59 and 22:01 becoming separate incidents.
+    Group anomalies by host and original security-event time.
     """
     groups: Dict[tuple[str, datetime], List[Anomaly]] = {}
-    anomalies_by_host: Dict[str, List[Anomaly]] = {}
 
     for anomaly in anomalies:
         event_window = event_windows.get(anomaly.feature_ref)
@@ -326,75 +317,17 @@ def _group_by_host_and_window(
             )
             continue
 
-        anomalies_by_host.setdefault(
-            anomaly.host,
-            [],
-        ).append(anomaly)
-
-    gap = timedelta(minutes=window_minutes)
-
-    for host, host_anomalies in anomalies_by_host.items():
-        ordered = sorted(
-            host_anomalies,
-            key=lambda anomaly: event_windows[
-                anomaly.feature_ref
-            ][0],
+        event_time = event_window[0]
+        window_start = _floor_to_window(
+            event_time,
+            window_minutes,
         )
 
-        current_group: List[Anomaly] = []
-        current_start: datetime | None = None
-        current_end: datetime | None = None
-
-        for anomaly in ordered:
-            event_start, event_end = event_windows[
-                anomaly.feature_ref
-            ]
-
-            if not current_group:
-                current_group = [anomaly]
-                current_start = event_start
-                current_end = event_end
-                continue
-
-            assert current_start is not None
-            assert current_end is not None
-
-            if event_start - current_end <= gap:
-                current_group.append(anomaly)
-
-                if event_end > current_end:
-                    current_end = event_end
-
-                continue
-
-            groups[
-                (
-                    host,
-                    _floor_to_window(
-                        current_start,
-                        window_minutes,
-                    ),
-                )
-            ] = current_group
-
-            current_group = [anomaly]
-            current_start = event_start
-            current_end = event_end
-
-        if current_group:
-            assert current_start is not None
-
-            groups[
-                (
-                    host,
-                    _floor_to_window(
-                        current_start,
-                        window_minutes,
-                    ),
-                )
-            ] = current_group
+        key = (anomaly.host, window_start)
+        groups.setdefault(key, []).append(anomaly)
 
     return groups
+
 
 def _build_incident(
     host: str,

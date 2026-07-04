@@ -2,13 +2,13 @@
 MITRE ATT&CK mapping service.
 
 Implements Stage 6 (MITRE ATT&CK Mapping) from ARCHITECTURE_V2.md: reads
-incidents from the `incidents` collection, derives behavioral signals
-from each incident's constituent anomalies (referenced via
-`Incident.event_sequence`), matches those signals against a curated
-local MITRE ATT&CK technique lookup table, and persists the resulting
-tactic/technique matches as `AttackMapping` documents into
-`attack_mappings`, with `incident_ref` set to the source incident's own
-`_id` (per task requirement).
+incidents from the `incidents` collection, reconstructs compact Sysmon
+evidence by traversing `Incident.event_sequence` -> `Anomaly` ->
+`ProcessedEvent` -> matching `RawLog` window events, matches those
+evidence rules against a curated local MITRE ATT&CK technique lookup
+table, and persists the resulting tactic/technique matches as
+`AttackMapping` documents into `attack_mappings`, with `incident_ref`
+set to the source incident's own `_id` (per task requirement).
 
 Per ARCHITECTURE_V2.md Section 2 ("Architecture Note — MITRE Local
 Cache") and Stage 6, mapping is kept grounded: this module selects
@@ -22,13 +22,13 @@ auditable without an LLM dependency.
 
 Behavioral signal source: `Incident` itself carries no behavioral
 fields (only host, start_time, end_time, event_sequence, status,
-created_at) — the actual behavior lives on the `Anomaly` documents
-referenced by `event_sequence`. This module therefore fetches each
-incident's constituent anomalies (by `_id`, via `event_sequence`) to
-derive signals, then maps at the incident level. This read is a
-necessary consequence of mapping incidents rather than anomalies
-directly; without it there is no behavioral content to match against
-MITRE techniques.
+created_at). The actual auditable behavior lives on raw Sysmon events,
+so this module reconstructs evidence through the required chain:
+incident.event_sequence -> anomaly.feature_ref -> processed_event ->
+raw_logs matching processed_event.host and
+[processed_event.window_start, processed_event.window_end). The
+processed_event.raw_log_ref fallback is used only when the full window
+query returns no raw logs.
 
 Expected `attack_lookup.json` shape (documented here since the dataset
 file itself is out of scope for this module):
@@ -39,14 +39,14 @@ file itself is out of scope for this module):
         "technique_id": "T1059",
         "technique_name": "Command and Scripting Interpreter",
         "severity_level": "High",
-        "signals": ["high_reconstruction_error", "anomalous_flag", ...]
+        "signals": ["powershell_encoded_command", "external_network_connection", ...]
       },
       ...
     ]
 
-Each entry's "signals" list is a set of behavioral signal keys (defined
-by `_derive_signals_from_incident` in this module) that, if present for
-a given incident, make that technique a candidate match.
+Each entry's "signals" list is a set of Sysmon evidence signal keys
+(defined by `_derive_rule_matches_from_evidence` in this module) that,
+if present for a given incident, make that technique a candidate match.
 
 This module reads from and writes to MongoDB directly via
 `app.db.mongo_client.get_database()`, consistent with the precedent set
@@ -57,6 +57,7 @@ by `app.services.log_ingestion`, `app.services.feature_engineering`,
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,38 +71,33 @@ from app.db.mongo_client import get_database
 from app.models.anomaly import Anomaly
 from app.models.attack_mapping import AttackMapping, SeverityLevel
 from app.models.incident import Incident
+from app.models.processed_event import ProcessedEvent
+from app.models.raw_log import RawLog
 
 logger = get_logger(__name__)
 
 _ANOMALIES_COLLECTION = "anomalies"
+_PROCESSED_EVENTS_COLLECTION = "processed_events"
+_RAW_LOGS_COLLECTION = "raw_logs"
 _INCIDENTS_COLLECTION = "incidents"
 _ATTACK_MAPPINGS_COLLECTION = "attack_mappings"
 
-# Behavioral signal keys this module knows how to derive from an
-# incident's constituent Anomaly documents. A lookup table entry's
-# "signals" list must use these exact keys to be matchable. Kept as an
-# explicit, closed set so a typo in attack_lookup.json fails loudly
-# rather than silently never matching.
+# Behavioral signal keys this module knows how to derive from raw
+# Sysmon evidence. A lookup table entry's "signals" list must use these
+# exact keys to be matchable. Kept as an explicit, closed set so a typo
+# in attack_lookup.json fails loudly rather than silently never
+# matching.
 _KNOWN_SIGNALS: FrozenSet[str] = frozenset(
     {
-        "anomalous_flag",
-        "high_reconstruction_error",
-        "multi_event_incident",
-        "multi_host_anomaly_burst",
+        "powershell_encoded_command",
+        "script_lolbin_execution",
+        "external_network_connection",
+        "lsass_access",
+        "registry_run_key_persistence",
+        "suspicious_file_drop",
+        "process_injection_access",
     }
 )
-
-# Multiplier applied to an anomaly's threshold_used to qualify its
-# reconstruction_error as "high" rather than merely anomalous. Kept as
-# a module-level constant rather than a magic number, consistent with
-# the threshold-multiplier pattern already used in the prior
-# anomaly-centric version of this module.
-_HIGH_ERROR_THRESHOLD_MULTIPLIER = 1.5
-
-# An incident with at least this many constituent anomalies is
-# considered to exhibit a multi-step behavioral pattern, distinct from
-# a single isolated anomalous event.
-_MULTI_EVENT_INCIDENT_MIN_COUNT = 3
 
 # Confidence assigned when exactly one candidate signal matches a
 # lookup entry. Scales up (never down) as more of the entry's declared
@@ -113,6 +109,68 @@ _BASE_SIGNAL_CONFIDENCE = 0.6
 # LLM-assisted verification (per Stage 6, that step is intentionally
 # out of scope here).
 _MAX_RULE_BASED_CONFIDENCE = 0.9
+
+_SYSMON_PROCESS_CREATE = 1
+_SYSMON_NETWORK_CONNECTION = 3
+_SYSMON_PROCESS_ACCESS = 10
+_SYSMON_FILE_CREATE = 11
+_SYSMON_REGISTRY_SET = 13
+
+_SCRIPT_LOLBINS = frozenset(
+    {
+        "cmd.exe",
+        "cscript.exe",
+        "mshta.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "regsvr32.exe",
+        "rundll32.exe",
+        "wscript.exe",
+    }
+)
+
+_PRIVATE_OR_LOCAL_IP_PREFIXES = (
+    "10.",
+    "172.16.",
+    "172.17.",
+    "172.18.",
+    "172.19.",
+    "172.20.",
+    "172.21.",
+    "172.22.",
+    "172.23.",
+    "172.24.",
+    "172.25.",
+    "172.26.",
+    "172.27.",
+    "172.28.",
+    "172.29.",
+    "172.30.",
+    "172.31.",
+    "192.168.",
+    "127.",
+    "::1",
+)
+
+
+@dataclass(frozen=True)
+class SysmonEvidence:
+    """One raw Sysmon event plus the reference chain used to retrieve it."""
+
+    anomaly_ref: Any
+    processed_event_ref: Any
+    raw_log: RawLog
+    used_raw_log_ref_fallback: bool = False
+
+
+@dataclass(frozen=True)
+class RuleMatch:
+    """A compact, explainable Sysmon rule hit."""
+
+    signal: str
+    reason: str
+    event_id: int
+    raw_log_ref: Any
 
 
 class MitreMappingError(RuntimeError):
@@ -279,46 +337,365 @@ async def _fetch_constituent_anomalies(incident: Incident) -> List[Anomaly]:
     return anomalies
 
 
-def _derive_signals_from_incident(
+async def _fetch_processed_events(
     incident: Incident, anomalies: Sequence[Anomaly]
-) -> Set[str]:
+) -> Dict[Any, ProcessedEvent]:
     """
-    Derive behavioral signal keys from an incident and its constituent
-    anomalies.
+    Fetch ProcessedEvent documents referenced by anomaly.feature_ref.
 
-    Args:
-        incident: The incident being mapped.
-        anomalies: The Anomaly documents referenced by
-            `incident.event_sequence`.
-
-    Returns:
-        The set of signal keys (drawn from `_KNOWN_SIGNALS`) present
-        for this incident.
+    This is the middle hop in the required evidence chain:
+    incident.event_sequence -> anomaly.feature_ref -> processed_event.
     """
-    signals: Set[str] = set()
-
     if not anomalies:
-        return signals
+        return {}
 
-    if any(anomaly.is_anomalous for anomaly in anomalies):
-        signals.add("anomalous_flag")
+    feature_refs = [anomaly.feature_ref for anomaly in anomalies]
+    db = get_database()
 
-    if any(
-        anomaly.reconstruction_error
-        > anomaly.threshold_used * _HIGH_ERROR_THRESHOLD_MULTIPLIER
-        for anomaly in anomalies
-        if anomaly.threshold_used > 0
-    ):
-        signals.add("high_reconstruction_error")
+    try:
+        cursor = db[_PROCESSED_EVENTS_COLLECTION].find(
+            {"_id": {"$in": feature_refs}}
+        )
+        processed_events: Dict[Any, ProcessedEvent] = {}
+        async for document in cursor:
+            try:
+                processed_event = ProcessedEvent(**document)
+                processed_events[processed_event.id] = processed_event
+            except Exception:  # noqa: BLE001 - isolate one bad document
+                logger.warning(
+                    "Skipping malformed processed_events document "
+                    "referenced by anomaly",
+                    extra={
+                        "incident_id": str(incident.id),
+                        "processed_event_id": str(document.get("_id")),
+                    },
+                )
+    except PyMongoError as exc:
+        logger.exception(
+            "Failed to fetch processed_events for incident",
+            extra={"incident_id": str(incident.id)},
+        )
+        raise MitreMappingError(
+            f"Failed to query processed_events for incident {incident.id}: {exc}"
+        ) from exc
 
-    if len(anomalies) >= _MULTI_EVENT_INCIDENT_MIN_COUNT:
-        signals.add("multi_event_incident")
+    return processed_events
 
-    distinct_hosts = {anomaly.host for anomaly in anomalies}
-    if len(distinct_hosts) > 1:
-        signals.add("multi_host_anomaly_burst")
 
-    return signals
+async def _fetch_raw_logs_for_processed_event(
+    processed_event: ProcessedEvent,
+) -> tuple[List[RawLog], bool]:
+    """
+    Fetch raw Sysmon logs for one processed event's host/window.
+
+    The primary query uses processed_event.host and the half-open
+    [window_start, window_end) timestamp range. processed_event.raw_log_ref
+    is used only if that full window query returns no raw logs.
+    """
+    db = get_database()
+
+    try:
+        cursor = db[_RAW_LOGS_COLLECTION].find(
+            {
+                "host": processed_event.host,
+                "timestamp": {
+                    "$gte": processed_event.window_start,
+                    "$lt": processed_event.window_end,
+                },
+            }
+        )
+        raw_logs: List[RawLog] = []
+        async for document in cursor:
+            try:
+                raw_logs.append(RawLog(**document))
+            except Exception:  # noqa: BLE001 - isolate one bad document
+                logger.warning(
+                    "Skipping malformed raw_logs document in processed "
+                    "event window",
+                    extra={
+                        "processed_event_id": str(processed_event.id),
+                        "raw_log_id": str(document.get("_id")),
+                    },
+                )
+    except PyMongoError as exc:
+        logger.exception(
+            "Failed to fetch raw_logs window for processed_event",
+            extra={"processed_event_id": str(processed_event.id)},
+        )
+        raise MitreMappingError(
+            f"Failed to query raw_logs for processed_event "
+            f"{processed_event.id}: {exc}"
+        ) from exc
+
+    if raw_logs:
+        return raw_logs, False
+
+    try:
+        document = await db[_RAW_LOGS_COLLECTION].find_one(
+            {
+                "_id": processed_event.raw_log_ref,
+                "host": processed_event.host,
+            }
+        )
+    except PyMongoError as exc:
+        logger.exception(
+            "Failed to fetch raw_log_ref fallback for processed_event",
+            extra={"processed_event_id": str(processed_event.id)},
+        )
+        raise MitreMappingError(
+            f"Failed to query raw_log_ref fallback for processed_event "
+            f"{processed_event.id}: {exc}"
+        ) from exc
+
+    if not document:
+        return [], True
+
+    try:
+        return [RawLog(**document)], True
+    except Exception:  # noqa: BLE001 - isolate one bad fallback document
+        logger.warning(
+            "Skipping malformed raw_log_ref fallback document",
+            extra={
+                "processed_event_id": str(processed_event.id),
+                "raw_log_id": str(document.get("_id")),
+            },
+        )
+        return [], True
+
+
+async def _fetch_sysmon_evidence(incident: Incident) -> List[SysmonEvidence]:
+    """
+    Reconstruct auditable Sysmon evidence for an incident.
+
+    Required traversal:
+    incident.event_sequence -> anomaly.feature_ref -> processed_event ->
+    raw_logs matching processed_event.host and
+    [processed_event.window_start, processed_event.window_end).
+    """
+    anomalies = await _fetch_constituent_anomalies(incident)
+    processed_events = await _fetch_processed_events(incident, anomalies)
+    evidence: List[SysmonEvidence] = []
+    seen_raw_log_ids: Set[Any] = set()
+
+    for anomaly in anomalies:
+        processed_event = processed_events.get(anomaly.feature_ref)
+        if not processed_event:
+            logger.warning(
+                "Skipping anomaly with unresolved feature_ref during "
+                "MITRE evidence reconstruction",
+                extra={
+                    "incident_id": str(incident.id),
+                    "anomaly_id": str(anomaly.id),
+                    "feature_ref": str(anomaly.feature_ref),
+                },
+            )
+            continue
+
+        raw_logs, used_fallback = await _fetch_raw_logs_for_processed_event(
+            processed_event
+        )
+        for raw_log in raw_logs:
+            if raw_log.id in seen_raw_log_ids:
+                continue
+            seen_raw_log_ids.add(raw_log.id)
+            evidence.append(
+                SysmonEvidence(
+                    anomaly_ref=anomaly.id,
+                    processed_event_ref=processed_event.id,
+                    raw_log=raw_log,
+                    used_raw_log_ref_fallback=used_fallback,
+                )
+            )
+
+    return sorted(evidence, key=lambda item: item.raw_log.timestamp)
+
+
+def _extract_raw_event_field(raw_event: Dict[str, Any], *candidates: str) -> str:
+    """Return the first non-empty raw_event field from possible exporter names."""
+    for key in candidates:
+        value = raw_event.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    return ""
+
+
+def _basename_lower(path: str) -> str:
+    """Return a lowercase executable/file basename from a Windows or POSIX path."""
+    normalized = path.replace("\\", "/").strip().lower()
+    return normalized.rsplit("/", maxsplit=1)[-1]
+
+
+def _looks_public_ip(ip_address: str) -> bool:
+    """Return True only for globally routable IP addresses."""
+    value = ip_address.strip()
+    if not value:
+        return False
+
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
+def _derive_rule_matches_from_evidence(
+    evidence_items: Sequence[SysmonEvidence],
+) -> List[RuleMatch]:
+    """
+    Apply compact, explainable Sysmon evidence rules.
+
+    These rules intentionally look only at raw Sysmon fields. They do
+    not use reconstruction_error or is_anomalous.
+    """
+    matches: List[RuleMatch] = []
+
+    for evidence in evidence_items:
+        raw_log = evidence.raw_log
+        raw_event = raw_log.raw_event
+        image = _extract_raw_event_field(raw_event, "Image", "image", "ProcessImage")
+        image_name = _basename_lower(image)
+        command_line = _extract_raw_event_field(
+            raw_event, "CommandLine", "command_line", "ProcessCommandLine"
+        )
+        command_line_lower = command_line.lower()
+
+        if raw_log.event_id == _SYSMON_PROCESS_CREATE:
+            if image_name in {"powershell.exe", "pwsh.exe"} and any(
+                token in command_line_lower
+                for token in ("-enc", "-encodedcommand", "frombase64string")
+            ):
+                matches.append(
+                    RuleMatch(
+                        signal="powershell_encoded_command",
+                        reason=(
+                            "Sysmon Event ID 1 process creation shows "
+                            "PowerShell with encoded command indicators."
+                        ),
+                        event_id=raw_log.event_id,
+                        raw_log_ref=raw_log.id,
+                    )
+                )
+
+            if image_name in _SCRIPT_LOLBINS and any(
+                token in command_line_lower
+                for token in (
+                    "http://",
+                    "https://",
+                    "javascript:",
+                    "vbscript:",
+                    ".sct",
+                    "downloadstring",
+                    "regsvr32",
+                    "rundll32",
+                )
+            ):
+                matches.append(
+                    RuleMatch(
+                        signal="script_lolbin_execution",
+                        reason=(
+                            "Sysmon Event ID 1 process creation shows a "
+                            "script-capable Windows binary with remote or "
+                            "script-loading command-line content."
+                        ),
+                        event_id=raw_log.event_id,
+                        raw_log_ref=raw_log.id,
+                    )
+                )
+
+        if raw_log.event_id == _SYSMON_NETWORK_CONNECTION:
+            destination_ip = _extract_raw_event_field(
+                raw_event, "DestinationIp", "destination_ip", "dest_ip"
+            )
+            destination_port = _extract_raw_event_field(
+                raw_event, "DestinationPort", "destination_port", "dest_port"
+            )
+            if _looks_public_ip(destination_ip) and destination_port:
+                matches.append(
+                    RuleMatch(
+                        signal="external_network_connection",
+                        reason=(
+                            "Sysmon Event ID 3 network connection targets "
+                            f"external address {destination_ip}:{destination_port}."
+                        ),
+                        event_id=raw_log.event_id,
+                        raw_log_ref=raw_log.id,
+                    )
+                )
+
+        if raw_log.event_id == _SYSMON_PROCESS_ACCESS:
+            target_image = _extract_raw_event_field(
+                raw_event, "TargetImage", "target_image"
+            ).lower()
+            granted_access = _extract_raw_event_field(
+                raw_event, "GrantedAccess", "granted_access"
+            ).lower()
+            if target_image.endswith("lsass.exe"):
+                matches.append(
+                    RuleMatch(
+                        signal="lsass_access",
+                        reason=(
+                            "Sysmon Event ID 10 process access targets "
+                            f"LSASS with GrantedAccess={granted_access or 'unknown'}."
+                        ),
+                        event_id=raw_log.event_id,
+                        raw_log_ref=raw_log.id,
+                    )
+                )
+            elif granted_access in {"0x1fffff", "0x1f0fff", "0x143a", "0x1410"}:
+                matches.append(
+                    RuleMatch(
+                        signal="process_injection_access",
+                        reason=(
+                            "Sysmon Event ID 10 process access uses access "
+                            f"mask {granted_access}, consistent with remote "
+                            "process manipulation."
+                        ),
+                        event_id=raw_log.event_id,
+                        raw_log_ref=raw_log.id,
+                    )
+                )
+
+        if raw_log.event_id == _SYSMON_REGISTRY_SET:
+            target_object = _extract_raw_event_field(
+                raw_event, "TargetObject", "target_object"
+            ).lower()
+            if "\\currentversion\\run" in target_object:
+                matches.append(
+                    RuleMatch(
+                        signal="registry_run_key_persistence",
+                        reason=(
+                            "Sysmon Event ID 13 registry value set touches "
+                            "a CurrentVersion\\Run persistence location."
+                        ),
+                        event_id=raw_log.event_id,
+                        raw_log_ref=raw_log.id,
+                    )
+                )
+
+        if raw_log.event_id == _SYSMON_FILE_CREATE:
+            target_filename = _extract_raw_event_field(
+                raw_event, "TargetFilename", "target_filename"
+            ).lower()
+            if any(
+                path_fragment in target_filename
+                for path_fragment in ("\\temp\\", "\\appdata\\", "\\startup\\")
+            ) and target_filename.endswith((".exe", ".dll", ".ps1", ".vbs", ".js")):
+                matches.append(
+                    RuleMatch(
+                        signal="suspicious_file_drop",
+                        reason=(
+                            "Sysmon Event ID 11 file creation writes an "
+                            "executable or script into a temp, appdata, or "
+                            "startup path."
+                        ),
+                        event_id=raw_log.event_id,
+                        raw_log_ref=raw_log.id,
+                    )
+                )
+
+    deduped: Dict[str, RuleMatch] = {}
+    for match in matches:
+        deduped.setdefault(match.signal, match)
+    return list(deduped.values())
 
 
 def _score_candidate(matched_signals: Set[str], entry_signals: Set[str]) -> float:
@@ -351,25 +728,31 @@ def _score_candidate(matched_signals: Set[str], entry_signals: Set[str]) -> floa
     return max(_BASE_SIGNAL_CONFIDENCE, min(confidence, _MAX_RULE_BASED_CONFIDENCE))
 
 
-def _build_justification(matched_signals: Set[str], technique_name: str) -> str:
+def _build_justification(
+    matched_rules: Sequence[RuleMatch], technique_name: str
+) -> str:
     """
     Build a rule-based, auditable justification string for a match.
 
     Since this module performs no LLM call (per task scope), the
-    justification is a deterministic description of which signals
-    triggered the match rather than free-text LLM reasoning.
+    justification is a deterministic description of which Sysmon
+    evidence rule(s) triggered the match rather than free-text LLM
+    reasoning.
     """
-    signal_list = ", ".join(sorted(matched_signals))
+    signal_list = ", ".join(sorted(match.signal for match in matched_rules))
+    event_list = "; ".join(
+        f"{match.signal}: {match.reason} raw_log_ref={match.raw_log_ref}"
+        for match in matched_rules
+    )
     return (
         f"Matched technique '{technique_name}' based on observed "
-        f"behavioral signal(s) across the incident's constituent "
-        f"events: {signal_list}."
+        f"Sysmon evidence signal(s): {signal_list}. Evidence: {event_list}"
     )
 
 
 def _map_incident_to_techniques(
     incident: Incident,
-    matched_signals: Set[str],
+    rule_matches: Sequence[RuleMatch],
     lookup_table: List[Dict[str, Any]],
 ) -> List[AttackMapping]:
     """
@@ -384,9 +767,11 @@ def _map_incident_to_techniques(
         A list of `AttackMapping` instances (possibly empty, if no
         lookup entry's signals matched this incident at all).
     """
+    matched_signals = {match.signal for match in rule_matches}
     if not matched_signals:
         return []
 
+    matches_by_signal = {match.signal: match for match in rule_matches}
     mappings: List[AttackMapping] = []
 
     for entry in lookup_table:
@@ -397,6 +782,9 @@ def _map_incident_to_techniques(
             continue
 
         overlap = matched_signals & entry_signals
+        matched_rules = [
+            matches_by_signal[signal] for signal in sorted(overlap)
+        ]
         technique_name = str(entry["technique_name"])
 
         try:
@@ -418,7 +806,9 @@ def _map_incident_to_techniques(
                 technique_name=technique_name,
                 confidence=confidence,
                 severity_level=severity_level,
-                justification_text=_build_justification(overlap, technique_name),
+                justification_text=_build_justification(
+                    matched_rules, technique_name
+                ),
             )
             mappings.append(mapping)
         except Exception:  # noqa: BLE001 - isolate one bad candidate
@@ -527,10 +917,11 @@ async def run_mitre_mapping() -> MitreMappingResult:
     Run Stage 6 (MITRE ATT&CK Mapping) end-to-end.
 
     Loads the local MITRE lookup table, fetches all `incidents`
-    documents not yet mapped, derives behavioral signals per incident
-    from its constituent anomalies, matches against lookup entries
-    (supporting one-to-many technique matches per incident), and
-    persists the resulting `AttackMapping` documents with
+    documents not yet mapped, reconstructs raw Sysmon evidence through
+    anomaly.feature_ref and processed_events, derives compact evidence
+    rule matches, matches against lookup entries (supporting one-to-many
+    technique matches per incident), and persists the resulting
+    `AttackMapping` documents with
     `incident_ref` set to the source incident's own `_id`.
 
     Returns:
@@ -569,24 +960,24 @@ async def run_mitre_mapping() -> MitreMappingResult:
 
     for incident in incidents:
         try:
-            anomalies = await _fetch_constituent_anomalies(incident)
-            matched_signals = _derive_signals_from_incident(incident, anomalies)
+            evidence = await _fetch_sysmon_evidence(incident)
+            rule_matches = _derive_rule_matches_from_evidence(evidence)
             mappings = _map_incident_to_techniques(
-                incident, matched_signals, lookup_table
+                incident, rule_matches, lookup_table
             )
         except MitreMappingError:
             # Infrastructure-level failure fetching this incident's
-            # anomalies; treat as a skip for this incident rather than
-            # aborting the whole run, consistent with the
+            # evidence chain; treat as a skip for this incident rather
+            # than aborting the whole run, consistent with the
             # per-document isolation used elsewhere in this module.
             logger.exception(
-                "Skipping incident due to anomaly fetch failure",
+                "Skipping incident due to MITRE evidence fetch failure",
                 extra={"incident_id": str(incident.id)},
             )
             result.skipped_incidents.append(
                 {
                     "incident_id": str(incident.id),
-                    "reason": "Failed to fetch constituent anomalies",
+                    "reason": "Failed to fetch Sysmon evidence chain",
                 }
             )
             continue

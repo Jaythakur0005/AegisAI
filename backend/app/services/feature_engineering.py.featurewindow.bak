@@ -5,6 +5,8 @@ Implements Stage 2 (Feature Engineering) from ARCHITECTURE_V2.md: reads
 raw Sysmon event records from the `raw_logs` collection, groups them by
 host and time window, extracts numerical feature vectors per window, and
 persists the result as `ProcessedEvent` documents into `processed_events`,
+linked back to their source `raw_logs` via `raw_log_ref`.
+
 ARCHITECTURE_V2.md Stage 2 names six feature categories without
 specifying exact formulas or window size. This module makes the
 following concrete (and documented) choices to operationalize them:
@@ -508,7 +510,7 @@ async def run_feature_engineering() -> FeatureEngineeringResult:
             processed_events fails at the infrastructure level.
     """
     settings = get_settings()
-    window_minutes = settings.feature_window_minutes
+    window_minutes = settings.incident_window_minutes
 
     logger.info(
         "Starting feature engineering run",

@@ -1,0 +1,162 @@
+"""
+Pipeline API routes.
+
+Exposes a single endpoint for executing the existing backend stages as
+one workflow:
+
+    POST /api/v1/pipeline/run
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, Field
+
+from app.core.logging import get_logger
+from app.services.pipeline import PipelineError, PipelineResult, run_pipeline
+
+logger = get_logger(__name__)
+
+router = APIRouter(prefix="/pipeline", tags=["Pipeline"])
+
+
+class PipelineRunRequest(BaseModel):
+    """Request body for a pipeline run."""
+
+    logs: List[Dict[str, Any]] = Field(
+        ...,
+        min_length=1,
+        description="Raw Sysmon JSON events to ingest and process.",
+    )
+
+
+class PipelineStageCounts(BaseModel):
+    """High-level count summary for a pipeline run."""
+
+    logs: int = Field(..., description="Total raw events attempted.")
+    raw_logs_inserted: int = Field(
+        ..., description="Raw log documents inserted into MongoDB."
+    )
+    processed: int = Field(
+        ..., description="Processed event windows inserted into MongoDB."
+    )
+    anomalies: int = Field(
+        ..., description="Events flagged as anomalous by the model."
+    )
+    anomaly_scores: int = Field(
+        ..., description="Total processed events scored by the model."
+    )
+    incidents: int = Field(..., description="Incident documents created.")
+    attack_mappings: int = Field(
+        ..., description="MITRE ATT&CK mapping documents created."
+    )
+    risk_scores: int = Field(
+        ..., description="Risk score documents created."
+    )
+    investigations: int = Field(
+        ..., description="Investigation reports created."
+    )
+
+
+class PipelineRunResponse(BaseModel):
+    """Response body for a successful pipeline run."""
+
+    summary: PipelineStageCounts = Field(
+        ..., description="High-level counts for the completed run."
+    )
+    raw_log_ids: List[str] = Field(
+        ..., description="Inserted raw_logs document identifiers."
+    )
+    processed_event_ids: List[str] = Field(
+        ..., description="Inserted processed_events document identifiers."
+    )
+    anomaly_ids: List[str] = Field(
+        ..., description="Inserted anomalies document identifiers."
+    )
+    incident_ids: List[str] = Field(
+        ..., description="Inserted incidents document identifiers."
+    )
+    attack_mapping_ids: List[str] = Field(
+        ..., description="Inserted attack_mappings document identifiers."
+    )
+    risk_score_ids: List[str] = Field(
+        ..., description="Inserted risk_scores document identifiers."
+    )
+    investigation_ids: List[str] = Field(
+        ..., description="Inserted investigations document identifiers."
+    )
+    ingestion_failures: List[Dict[str, Any]] = Field(
+        ..., description="Events that failed parsing or ingestion."
+    )
+    skipped_raw_logs: List[Dict[str, Any]] = Field(
+        ..., description="Raw log windows skipped during feature engineering."
+    )
+    skipped_processed_events: List[Dict[str, Any]] = Field(
+        ..., description="Processed events skipped during anomaly detection."
+    )
+    skipped_incident_groups: List[Dict[str, Any]] = Field(
+        ..., description="Anomaly groups skipped during incident building."
+    )
+
+    @classmethod
+    def from_pipeline_result(
+        cls, result: PipelineResult
+    ) -> "PipelineRunResponse":
+        """Build an API response from a service-layer pipeline result."""
+        return cls(
+            summary=PipelineStageCounts(**result.summary),
+            raw_log_ids=result.ingestion.inserted_ids,
+            processed_event_ids=result.feature_engineering.inserted_ids,
+            anomaly_ids=result.anomaly_detection.inserted_ids,
+            incident_ids=result.incident_building.inserted_ids,
+            attack_mapping_ids=result.mitre_mapping.inserted_ids,
+            risk_score_ids=result.risk_scoring.inserted_ids,
+            investigation_ids=result.investigation_reporting.inserted_ids,
+            ingestion_failures=result.ingestion.failed,
+            skipped_raw_logs=result.feature_engineering.skipped_raw_logs,
+            skipped_processed_events=(
+                result.anomaly_detection.skipped_processed_events
+            ),
+            skipped_incident_groups=result.incident_building.skipped_groups,
+        )
+
+
+@router.post(
+    "/run",
+    response_model=PipelineRunResponse,
+    summary="Run the full threat investigation pipeline",
+    description=(
+        "Ingest raw Sysmon JSON logs, engineer features, run anomaly "
+        "detection, build incidents, map MITRE ATT&CK techniques, score "
+        "risk, and generate investigation reports in one workflow."
+    ),
+)
+async def run_pipeline_endpoint(
+    request: PipelineRunRequest,
+) -> PipelineRunResponse:
+    """
+    Execute the complete backend pipeline for uploaded Sysmon logs.
+
+    Raises:
+        HTTPException: 500 if any stage fails at the infrastructure or
+            model-artifact level.
+    """
+    logger.info(
+        "Received pipeline run request",
+        extra={"logs_received": len(request.logs)},
+    )
+
+    try:
+        result = await run_pipeline(request.logs)
+    except PipelineError as exc:
+        logger.exception(
+            "Pipeline run failed", extra={"failed_stage": exc.stage}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"stage": exc.stage, "reason": exc.reason},
+        ) from exc
+
+    return PipelineRunResponse.from_pipeline_result(result)

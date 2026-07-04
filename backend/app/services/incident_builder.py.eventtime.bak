@@ -65,7 +65,6 @@ from app.models.incident import Incident, IncidentStatus
 logger = get_logger(__name__)
 
 _ANOMALIES_COLLECTION = "anomalies"
-_PROCESSED_EVENTS_COLLECTION = "processed_events"
 _INCIDENTS_COLLECTION = "incidents"
 
 
@@ -235,212 +234,44 @@ async def _fetch_unassigned_anomalies() -> List[Anomaly]:
     return anomalies
 
 
-async def _resolve_anomaly_event_windows(
-    anomalies: Sequence[Anomaly],
-) -> Dict[Any, tuple[datetime, datetime]]:
-    """
-    Resolve each anomaly to the source processed-event window.
-
-    `Anomaly.detected_at` is inference time. Stage 4 correlation must use
-    the original behavioural window represented by `feature_ref`.
-    """
-    if not anomalies:
-        return {}
-
-    db = get_database()
-    feature_refs = [anomaly.feature_ref for anomaly in anomalies]
-
-    event_windows: Dict[Any, tuple[datetime, datetime]] = {}
-
-    try:
-        cursor = db[_PROCESSED_EVENTS_COLLECTION].find(
-            {"_id": {"$in": feature_refs}},
-            {
-                "_id": 1,
-                "window_start": 1,
-                "window_end": 1,
-            },
-        )
-
-        async for document in cursor:
-            window_start = document.get("window_start")
-            window_end = document.get("window_end")
-
-            if not isinstance(window_start, datetime):
-                continue
-
-            if not isinstance(window_end, datetime):
-                continue
-
-            if window_start.tzinfo is None:
-                window_start = window_start.replace(tzinfo=timezone.utc)
-
-            if window_end.tzinfo is None:
-                window_end = window_end.replace(tzinfo=timezone.utc)
-
-            event_windows[document["_id"]] = (
-                window_start,
-                window_end,
-            )
-
-    except PyMongoError as exc:
-        logger.exception(
-            "Failed to resolve anomaly processed-event windows"
-        )
-        raise IncidentBuilderError(
-            f"Failed to query processed_events: {exc}"
-        ) from exc
-
-    return event_windows
-
-
 def _group_by_host_and_window(
-    anomalies: Sequence[Anomaly],
-    event_windows: Dict[Any, tuple[datetime, datetime]],
-    window_minutes: int,
+    anomalies: Sequence[Anomaly], window_minutes: int
 ) -> Dict[tuple[str, datetime], List[Anomaly]]:
-    """
-    Correlate anomalies into host-local incident sessions.
-
-    Anomalies are ordered by original processed-event time. For each
-    host, a new incident session starts only when the next anomalous
-    event begins more than `window_minutes` after the latest event end
-    already included in the current session.
-
-    This avoids arbitrary fixed-clock boundary splits such as
-    21:59 and 22:01 becoming separate incidents.
-    """
+    """Group anomalies by (host, window_start) per the configured window size."""
     groups: Dict[tuple[str, datetime], List[Anomaly]] = {}
-    anomalies_by_host: Dict[str, List[Anomaly]] = {}
-
     for anomaly in anomalies:
-        event_window = event_windows.get(anomaly.feature_ref)
-
-        if event_window is None:
-            logger.warning(
-                "Skipping anomaly with unresolved feature_ref",
-                extra={
-                    "anomaly_id": str(anomaly.id),
-                    "feature_ref": str(anomaly.feature_ref),
-                },
-            )
-            continue
-
-        anomalies_by_host.setdefault(
-            anomaly.host,
-            [],
-        ).append(anomaly)
-
-    gap = timedelta(minutes=window_minutes)
-
-    for host, host_anomalies in anomalies_by_host.items():
-        ordered = sorted(
-            host_anomalies,
-            key=lambda anomaly: event_windows[
-                anomaly.feature_ref
-            ][0],
-        )
-
-        current_group: List[Anomaly] = []
-        current_start: datetime | None = None
-        current_end: datetime | None = None
-
-        for anomaly in ordered:
-            event_start, event_end = event_windows[
-                anomaly.feature_ref
-            ]
-
-            if not current_group:
-                current_group = [anomaly]
-                current_start = event_start
-                current_end = event_end
-                continue
-
-            assert current_start is not None
-            assert current_end is not None
-
-            if event_start - current_end <= gap:
-                current_group.append(anomaly)
-
-                if event_end > current_end:
-                    current_end = event_end
-
-                continue
-
-            groups[
-                (
-                    host,
-                    _floor_to_window(
-                        current_start,
-                        window_minutes,
-                    ),
-                )
-            ] = current_group
-
-            current_group = [anomaly]
-            current_start = event_start
-            current_end = event_end
-
-        if current_group:
-            assert current_start is not None
-
-            groups[
-                (
-                    host,
-                    _floor_to_window(
-                        current_start,
-                        window_minutes,
-                    ),
-                )
-            ] = current_group
-
+        window_start = _floor_to_window(anomaly.detected_at, window_minutes)
+        key = (anomaly.host, window_start)
+        groups.setdefault(key, []).append(anomaly)
     return groups
+
 
 def _build_incident(
     host: str,
     anomalies: Sequence[Anomaly],
-    event_windows: Dict[Any, tuple[datetime, datetime]],
 ) -> Incident:
     """
-    Build an incident ordered by original processed-event window time.
+    Build a single `Incident` from a chronologically-ordered group of
+    anomalies for one host.
+
+    `event_sequence` is populated with anomaly `_id`s ordered by
+    `detected_at` ascending, forming the chronological timeline
+    described in Stage 4.
+
+    Raises:
+        ValueError: If `anomalies` is empty, or if `Incident`
+            validation fails (e.g. end_time before start_time, which
+            should not occur given sorted input but is guarded by the
+            model itself).
     """
     if not anomalies:
-        raise ValueError(
-            "Cannot build an Incident from an empty anomaly group"
-        )
+        raise ValueError("Cannot build an Incident from an empty anomaly group")
 
-    unresolved = [
-        anomaly
-        for anomaly in anomalies
-        if anomaly.feature_ref not in event_windows
-    ]
+    ordered_anomalies = sorted(anomalies, key=lambda anomaly: anomaly.detected_at)
 
-    if unresolved:
-        raise ValueError(
-            "Cannot build Incident with unresolved feature_ref values"
-        )
-
-    ordered_anomalies = sorted(
-        anomalies,
-        key=lambda anomaly: event_windows[
-            anomaly.feature_ref
-        ][0],
-    )
-
-    start_time = min(
-        event_windows[anomaly.feature_ref][0]
-        for anomaly in ordered_anomalies
-    )
-
-    end_time = max(
-        event_windows[anomaly.feature_ref][1]
-        for anomaly in ordered_anomalies
-    )
-
-    event_sequence = [
-        anomaly.id
-        for anomaly in ordered_anomalies
-    ]
+    start_time = ordered_anomalies[0].detected_at
+    end_time = ordered_anomalies[-1].detected_at
+    event_sequence = [anomaly.id for anomaly in ordered_anomalies]
 
     return Incident(
         host=host,
@@ -525,24 +356,7 @@ async def run_incident_building() -> IncidentBuilderResult:
         logger.info("No unassigned anomalous events found; nothing to build")
         return result
 
-    event_windows = await _resolve_anomaly_event_windows(
-        anomalies
-    )
-
-    logger.info(
-        "Resolved anomaly event windows",
-        extra={
-            "anomaly_count": len(anomalies),
-            "resolved_count": len(event_windows),
-        },
-    )
-
-    grouped = _group_by_host_and_window(
-        anomalies,
-        event_windows,
-        window_minutes,
-    )
-
+    grouped = _group_by_host_and_window(anomalies, window_minutes)
     logger.info(
         "Grouped anomalies into host/window buckets",
         extra={"group_count": len(grouped)},
@@ -552,11 +366,7 @@ async def run_incident_building() -> IncidentBuilderResult:
 
     for (host, window_start), group_anomalies in grouped.items():
         try:
-            incident = _build_incident(
-                host,
-                group_anomalies,
-                event_windows,
-            )
+            incident = _build_incident(host, group_anomalies)
             severity = compute_incident_severity(group_anomalies)
 
             logger.info(

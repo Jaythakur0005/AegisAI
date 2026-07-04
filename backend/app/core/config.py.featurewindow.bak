@@ -77,7 +77,6 @@ class Settings(BaseSettings):
     anomaly_threshold_value: Optional[float] = Field(default=None)
 
     # ---------------- Incident Timeline Builder ----------------
-    feature_window_minutes: int = Field(default=1)
     incident_window_minutes: int = Field(default=20)
 
     # ---------------- MITRE ATT&CK Local Cache ----------------
