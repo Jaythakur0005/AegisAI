@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { AlertTriangle, Loader, ShieldOff } from "lucide-react";
 import { getIncidents } from "../lib/api";
-import type { IncidentResponse, IncidentListResponse } from "../types/api";
 import { ApiError } from "../lib/api";
+import type { IncidentListResponse, IncidentResponse } from "../types/api";
 import SeverityBadge from "../components/SeverityBadge";
 
 const PAGE_SIZE = 20;
@@ -10,10 +11,10 @@ const PAGE_SIZE = 20;
 function formatDateTime(iso: string): string {
   try {
     return new Date(iso).toLocaleString(undefined, {
-      year:   "numeric",
-      month:  "short",
-      day:    "2-digit",
-      hour:   "2-digit",
+      year: "numeric",
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
       minute: "2-digit",
       hour12: false,
     });
@@ -25,15 +26,14 @@ function formatDateTime(iso: string): string {
 export default function DashboardPage() {
   const navigate = useNavigate();
 
-  const [data, setData]       = useState<IncidentListResponse | null>(null);
+  const [data, setData] = useState<IncidentListResponse | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError]     = useState<string | null>(null);
-  const [page, setPage]       = useState(1);
+  const [error, setError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
 
   const fetchIncidents = useCallback(async (targetPage: number) => {
     setLoading(true);
     setError(null);
-
     try {
       const result = await getIncidents({ page: targetPage, page_size: PAGE_SIZE });
       setData(result);
@@ -50,27 +50,27 @@ export default function DashboardPage() {
     }
   }, []);
 
-  useEffect(() => {
-    fetchIncidents(page);
-  }, [page, fetchIncidents]);
+  useEffect(() => { fetchIncidents(page); }, [page, fetchIncidents]);
 
-  // ── Loading ──────────────────────────────────────────────────────────────
   if (loading) {
     return (
       <div className="state-container">
-        <span className="state-icon">⏳</span>
-        <span className="state-title">Loading incidents…</span>
+        <div className="state-icon-wrap">
+          <Loader size={20} strokeWidth={1.8} />
+        </div>
+        <span className="state-title">Loading incidents</span>
       </div>
     );
   }
 
-  // ── Error ────────────────────────────────────────────────────────────────
   if (error !== null) {
     return (
       <div className="state-container">
-        <span className="state-icon">⚠️</span>
+        <div className="state-icon-wrap">
+          <AlertTriangle size={20} strokeWidth={1.8} />
+        </div>
         <span className="state-title">Failed to load incidents</span>
-        <span className="error-message">{error}</span>
+        <span className="error-detail">{error}</span>
         <button className="retry-btn" onClick={() => fetchIncidents(page)}>
           Retry
         </button>
@@ -81,7 +81,6 @@ export default function DashboardPage() {
   const incidents: IncidentResponse[] = data?.items ?? [];
   const pagination = data?.pagination;
 
-  // ── Empty ────────────────────────────────────────────────────────────────
   if (incidents.length === 0) {
     return (
       <>
@@ -90,7 +89,9 @@ export default function DashboardPage() {
           <p>Detected anomalous activity, correlated into incidents.</p>
         </div>
         <div className="state-container">
-          <span className="state-icon">🛡</span>
+          <div className="state-icon-wrap">
+            <ShieldOff size={20} strokeWidth={1.8} />
+          </div>
           <span className="state-title">No incidents found</span>
           <span className="state-body">
             No correlated anomalous activity is currently available.
@@ -100,7 +101,6 @@ export default function DashboardPage() {
     );
   }
 
-  // ── Table ────────────────────────────────────────────────────────────────
   const totalPages = pagination?.total_pages ?? 1;
   const totalItems = pagination?.total_items ?? incidents.length;
 
@@ -132,23 +132,17 @@ export default function DashboardPage() {
                 role="button"
                 tabIndex={0}
                 onClick={() => navigate(`/incidents/${incident.id}`)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
                     navigate(`/incidents/${incident.id}`);
                   }
                 }}
               >
                 <td className="host-cell">{incident.host}</td>
-                <td>
-                  <SeverityBadge severity={incident.severity} />
-                </td>
-                <td>
-                  <span className="status-chip">{incident.status}</span>
-                </td>
-                <td className="time-cell">
-                  {formatDateTime(incident.start_time)}
-                </td>
+                <td><SeverityBadge severity={incident.severity} /></td>
+                <td><span className="status-chip">{incident.status}</span></td>
+                <td className="time-cell">{formatDateTime(incident.start_time)}</td>
               </tr>
             ))}
           </tbody>
@@ -156,9 +150,7 @@ export default function DashboardPage() {
 
         {totalPages > 1 && pagination && (
           <div className="pagination-bar">
-            <span>
-              Page {pagination.page} of {totalPages}
-            </span>
+            <span>Page {pagination.page} of {totalPages}</span>
             <div className="pagination-controls">
               <button
                 className="page-btn"
