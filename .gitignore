@@ -13,3 +13,10 @@ venv/
 .DS_Store
 
 *.log
+
+# Local datasets and generated frontend outputs
+Security-Datasets/
+training/dataset/
+training/sample_logs/
+frontend/node_modules/
+frontend/dist/
