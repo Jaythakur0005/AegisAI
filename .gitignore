@@ -20,3 +20,8 @@ training/dataset/
 training/sample_logs/
 frontend/node_modules/
 frontend/dist/
+
+# Python test and coverage outputs
+.coverage
+.pytest_cache/
+htmlcov/
