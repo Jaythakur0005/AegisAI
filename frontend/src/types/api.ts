@@ -142,4 +142,56 @@ export interface PipelineRunResponse {
   skipped_incident_groups: Record<string, unknown>[];
 }
 
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
 
+export interface DashboardCounts {
+  raw_logs: number;
+  processed_events: number;
+  anomaly_scores: number;
+  anomalous: number;
+  incidents: number;
+  attack_mappings: number;
+  risk_scores: number;
+  investigations: number;
+}
+
+export interface DashboardAnomalySummary {
+  anomaly_rate: number;
+  average_reconstruction_error: number;
+  maximum_reconstruction_error: number;
+  average_threshold: number;
+}
+
+export interface DashboardRiskSummary {
+  average_final_score: number;
+  maximum_final_score: number;
+  severity_counts: Record<string, number>;
+}
+
+export interface DashboardModelSummary {
+  model_version: string;
+  training_date: string;
+  threshold_value: number;
+  training_loss: number;
+  validation_loss: number;
+}
+
+export interface DashboardTopAnomalousHost {
+  host: string;
+  anomaly_count: number;
+}
+
+export interface DashboardHostsSummary {
+  unique_scored_host_count: number;
+  top_anomalous_hosts: DashboardTopAnomalousHost[];
+}
+
+export interface DashboardSummaryResponse {
+  counts: DashboardCounts;
+  anomaly_summary: DashboardAnomalySummary;
+  risk_summary: DashboardRiskSummary;
+  model: DashboardModelSummary | null;
+  hosts: DashboardHostsSummary;
+}

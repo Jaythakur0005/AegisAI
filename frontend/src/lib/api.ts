@@ -5,6 +5,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type {
+  DashboardSummaryResponse,
   IncidentDetailResponse,
   IncidentFilters,
   IncidentListResponse,
@@ -185,4 +186,18 @@ export async function runPipeline(
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /dashboard/summary
+ * Returns the aggregate dashboard summary: collection counts, anomaly
+ * and risk statistics, latest model metadata (null if absent), and
+ * host-level anomaly rankings.
+ */
+export async function getDashboardSummary(): Promise<DashboardSummaryResponse> {
+  return request<DashboardSummaryResponse>("/dashboard/summary");
 }
